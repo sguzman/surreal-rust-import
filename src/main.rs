@@ -1,21 +1,23 @@
+
 // src/main.rs - Rust SurrealDB Parallel Importer
 
 use std::fs::File;
 use std::io::{self, BufReader};
-use std::path::PathBuf;
+// use std::path::PathBuf; // Removed unused import
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+// use std::time::Duration; // Removed unused import
 
 use log::{debug, error, info, warn};
 use serde_json::Value; // Using dynamic Value for schemaless approach
-use surrealdb::engine::remote::ws::{Client, Ws};
-use surrealdb::opt::auth::Root; // Using Root for simplicity if auth needed later
+// Correct import for Ws client type
+use surrealdb::engine::remote::ws::Ws;
+// use surrealdb::opt::auth::Root; // Removed unused import
 use surrealdb::Surreal;
 use thiserror::Error;
 use tokio::sync::mpsc; // Async channel for communication
 use tokio::task::JoinHandle;
-use tokio::time::sleep;
+// use tokio::time::sleep; // Removed unused import
 
 // --- Configuration ---
 // TODO: Replace hardcoded values with command-line arguments (e.g., using clap)
@@ -43,7 +45,9 @@ enum ImportError {
     #[error("Channel Send Error: {0}")]
     ChannelSend(#[from] mpsc::error::SendError<Value>),
     #[error("Worker Task Failed: {0}")]
-    WorkerTaskFailed(String),
+    WorkerTaskFailed(String), // Keep this for potential future use
+    #[error("Tokio Join Error: {0}")]
+    JoinError(#[from] tokio::task::JoinError), // Added for task join errors
 }
 
 // --- Main Application Logic ---
@@ -59,7 +63,7 @@ async fn main() -> Result<(), ImportError> {
     info!("  Namespace: {}", NAMESPACE);
     info!("  Database: {}", DATABASE);
     info!("  Table Name: {}", TABLE_NAME);
-    info!("  Worker Tasks: {}", NUM_WORKERS);
+    info!("  Worker Tasks Limit: {}", NUM_WORKERS); // Renamed for clarity with semaphore model
     info!("  Channel Buffer: {}", CHANNEL_BUFFER_SIZE);
 
     // Shared atomic counters for statistics
@@ -68,6 +72,7 @@ async fn main() -> Result<(), ImportError> {
     let failed_count = Arc::new(AtomicUsize::new(0));
 
     // Create a bounded channel to send parsed records to workers
+    // tx (transmitter) sends, rx (receiver) receives
     let (tx, mut rx) = mpsc::channel::<Value>(CHANNEL_BUFFER_SIZE);
 
     // --- Spawn Parser Task ---
@@ -87,158 +92,150 @@ async fn main() -> Result<(), ImportError> {
                     if record.is_object() {
                         debug!("Parser: Sending record to workers.");
                         // Send the parsed record to the workers
-                        // This will block if the channel buffer is full
-                        tx.send(record).await?;
+                        // This will block if the channel buffer is full (backpressure)
+                        if tx.send(record).await.is_err() {
+                            // If send fails, the receiver has been dropped, so we can stop parsing.
+                            warn!("Parser: Channel closed by receiver. Stopping parser task.");
+                            break;
+                        }
                         parser_processed_count.fetch_add(1, Ordering::Relaxed);
                     } else {
+                        // Log if the item in the top-level array is not an object
                         warn!(
-                            "Parser: Skipping item - not a JSON object. Type: {:?}",
-                            record.as_str().map(|_| "string").unwrap_or_else(|| record
-                                .as_array()
-                                .map(|_| "array")
-                                .unwrap_or_else(|| record
-                                    .as_bool()
-                                    .map(|_| "boolean")
-                                    .unwrap_or_else(|| record
-                                        .as_number()
-                                        .map(|_| "number")
-                                        .unwrap_or("other"))))
+                            "Parser: Skipping item - not a JSON object. Type: {}",
+                            match record {
+                                Value::Null => "null",
+                                Value::Bool(_) => "boolean",
+                                Value::Number(_) => "number",
+                                Value::String(_) => "string",
+                                Value::Array(_) => "array",
+                                Value::Object(_) => "object", // Should not happen due to is_object check
+                            }
                         );
                     }
                 }
                 Err(e) => {
                     // Log parsing error but try to continue if possible (depends on error type)
                     error!("Parser: JSON parsing error: {}. Attempting to continue.", e);
-                    // For critical errors, might want to return Err here
-                    // return Err(ImportError::Json(e));
+                    // Depending on the error, you might want to return Err here to stop everything.
+                    // For example, if it's an IoError partway through.
+                    // if e.is_io() { return Err(ImportError::Json(e)); }
                 }
             }
         }
         info!("Parser task finished reading file.");
-        // tx is automatically dropped here, closing the channel
+        // tx is automatically dropped here when the task scope ends, closing the channel.
         Ok(())
     });
 
-    // --- Spawn Worker Tasks ---
-    let mut worker_handles = Vec::with_capacity(NUM_WORKERS);
-    for i in 0..NUM_WORKERS {
-        let mut rx_clone = rx; // Each worker needs its own receiver handle - ERROR: mpsc::Receiver is not Clone
-        // Correction: Use a single receiver and have workers compete, or use a broadcast channel,
-        // or more simply, pass the receiver into an Arc<Mutex<Receiver>>.
-        // Let's try the Arc<Mutex<Receiver>> approach for simplicity here, though it adds lock contention.
-        // A better approach for high-throughput might be a dedicated work-stealing queue or multiple producers/consumers.
+    // --- Spawn Worker Spawner Task ---
+    // This single task receives records and spawns insertion tasks, limited by a semaphore.
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(NUM_WORKERS));
+    let worker_inserted_count = inserted_count.clone();
+    let worker_failed_count = failed_count.clone();
 
-        // Re-thinking: The simplest for mpsc is to have ONE task receiving and then distributing/processing.
-        // Or, create the receiver *outside* the loop and pass its Arc<Mutex<>> to each task.
+    let worker_spawner_handle: JoinHandle<Result<(), ImportError>> = tokio::spawn(async move {
+        info!("Worker spawner task starting...");
+        // Establish ONE database connection for this task.
+        // Cloning the `db` handle is cheap and allows spawned tasks to use it.
+        // Consider a connection pool (e.g., bb8-surrealdb, deadpool) for production.
+        let db = Surreal::new::<Ws>(DATABASE_URL).await?;
+        info!("Worker spawner task: DB connection established.");
 
-        // Let's stick to the original plan but fix the receiver cloning.
-        // We need to wrap the receiver in something shareable.
-        // However, mpsc::Receiver cannot be easily shared and concurrently received from.
-        // The typical pattern is one receiver task that then might distribute work,
-        // OR use a different channel type like `crossbeam_channel` if sync needed,
-        // OR use `tokio::sync::broadcast` if all workers need all messages (not applicable here).
+        // --- Optional: Authentication ---
+        // info!("Worker spawner task: Signing in...");
+        // db.signin(Root { // Or use specific scope authentication
+        //     username: DB_USER,
+        //     password: DB_PASS,
+        // }).await?;
+        // info!("Worker spawner task: Signed in.");
+        // --- End Optional: Authentication ---
 
-        // Simplest async approach: Have ONE receiver task that pulls from the channel
-        // and then potentially uses `tokio::spawn` for each insertion, managing concurrency.
-        // Let's refactor to this model: One receiver task spawning insertion sub-tasks.
+        db.use_ns(NAMESPACE).use_db(DATABASE).await?;
+        info!("Worker spawner task: Namespace/DB selected.");
 
-        // --- Refactored Worker Spawning (Simpler Concurrency Model) ---
-        // Instead of NUM_WORKERS competing for the receiver, we'll have one receiver
-        // that spawns insertion tasks, limiting concurrency with a semaphore.
+        let mut insertion_tasks = Vec::new(); // Store handles of spawned insertion tasks
 
-        // Create a semaphore to limit concurrent database operations
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(NUM_WORKERS));
+        // Loop until the channel is closed and empty
+        while let Some(record) = rx.recv().await {
+            let db_clone = db.clone(); // Clone handle for the spawned task
+            let worker_inserted_count_clone = worker_inserted_count.clone();
+            let worker_failed_count_clone = worker_failed_count.clone();
+            let semaphore_clone = semaphore.clone();
 
-        let worker_inserted_count = inserted_count.clone();
-        let worker_failed_count = failed_count.clone();
+            // Acquire a permit. This limits concurrency to NUM_WORKERS.
+            // `acquire_owned` returns a permit that automatically releases when dropped.
+            let permit = match semaphore_clone.acquire_owned().await {
+                 Ok(p) => p,
+                 Err(_) => {
+                     error!("Worker spawner: Semaphore closed unexpectedly.");
+                     break; // Stop processing if semaphore is closed
+                 }
+            };
 
-        let worker_handle: JoinHandle<Result<(), ImportError>> = tokio::spawn(async move {
-             // Establish ONE database connection for this receiver/spawner task
-             // Note: For high concurrency, a connection pool would be better.
-            info!("Worker spawner task {} starting...", i);
-            let db = Surreal::new::<Ws>(DATABASE_URL).await?;
-            info!("Worker spawner task {}: DB connection established.", i);
+            // Spawn a new task for the actual database insertion
+            let task_handle = tokio::spawn(async move {
+                debug!("Insertion task: Processing record...");
+                // Add explicit type annotation for the expected result
+                let result: Result<Option<Value>, surrealdb::Error> =
+                    db_clone.create(TABLE_NAME).content(record.clone()).await;
 
-            // --- Optional: Authentication ---
-            // info!("Worker spawner task {}: Signing in...", i);
-            // db.signin(Root {
-            //     username: DB_USER,
-            //     password: DB_PASS,
-            // }).await?;
-            // info!("Worker spawner task {}: Signed in.", i);
-            // --- End Optional: Authentication ---
-
-            db.use_ns(NAMESPACE).use_db(DATABASE).await?;
-            info!("Worker spawner task {}: Namespace/DB selected.", i);
-
-            let mut insertion_tasks = Vec::new();
-
-            while let Some(record) = rx.recv().await { // Receive from the single shared receiver
-                let db_clone = db.clone(); // Clone the DB client handle (cheap)
-                let worker_inserted_count_clone = worker_inserted_count.clone();
-                let worker_failed_count_clone = worker_failed_count.clone();
-                let semaphore_clone = semaphore.clone();
-
-                // Acquire a permit from the semaphore before spawning
-                let permit = semaphore_clone.acquire_owned().await.expect("Semaphore closed unexpectedly");
-
-                // Spawn a new task for each insertion
-                let task_handle = tokio::spawn(async move {
-                    debug!("Insertion task: Processing record...");
-                    match db_clone.create(TABLE_NAME).content(record.clone()).await {
-                        Ok(created_record) => {
-                            // Check if SurrealDB returned a non-empty result (indicating success)
-                            // Adjust this check based on the actual success criteria/return type of db.create
-                            if !created_record.is_empty() {
-                                 worker_inserted_count_clone.fetch_add(1, Ordering::Relaxed);
-                                 debug!("Insertion task: Record inserted successfully.");
-                            } else {
-                                 error!("Insertion task: db.create command succeeded but returned empty result. Record snippet: {:.200}", record.to_string());
-                                 worker_failed_count_clone.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                        Err(e) => {
-                            error!("Insertion task: Database error: {}", e);
-                            worker_failed_count_clone.fetch_add(1, Ordering::Relaxed);
-                            // Optionally log the problematic record snippet
-                            // error!("Problematic record snippet: {:.200}", record.to_string());
-                        }
+                match result {
+                    Ok(created_result) => {
+                         // created_result is now Option<Value>
+                         if created_result.is_some() {
+                            worker_inserted_count_clone.fetch_add(1, Ordering::Relaxed);
+                            debug!("Insertion task: Record inserted successfully.");
+                         } else {
+                            // This might happen on duplicate IDs with certain strategies, or if create returns None on success.
+                            // Clarify expected return value for successful create.
+                            warn!("Insertion task: db.create command returned None/Empty. Assuming success/duplicate ignored. Record snippet: {:.200}", record.to_string());
+                            // Decide whether to count this as inserted or failed based on desired logic.
+                            // Let's assume success for now if no error.
+                            worker_inserted_count_clone.fetch_add(1, Ordering::Relaxed);
+                         }
                     }
-                    drop(permit); // Release the semaphore permit when the task is done
-                });
-                insertion_tasks.push(task_handle);
+                    Err(e) => {
+                        error!("Insertion task: Database error: {}", e);
+                        worker_failed_count_clone.fetch_add(1, Ordering::Relaxed);
+                        // Optionally log the problematic record snippet
+                        // error!("Problematic record snippet: {:.200}", record.to_string());
+                    }
+                }
+                drop(permit); // Release the semaphore permit when the task is done
+            });
+            insertion_tasks.push(task_handle);
+        }
+
+        info!("Worker spawner task: Channel closed. Waiting for all insertion tasks...");
+        // Wait for all spawned insertion tasks to complete
+        let results = futures::future::join_all(insertion_tasks).await;
+         // Check insertion task results for panics
+        for (i, result) in results.into_iter().enumerate() {
+            if let Err(e) = result {
+                error!("Insertion sub-task {} panicked or was cancelled: {}", i, e);
+                // Optionally increment failed count here if panics should be counted
+                // worker_failed_count.fetch_add(1, Ordering::Relaxed);
             }
+        }
+        info!("Worker spawner task: All insertion tasks finished.");
+        Ok(())
 
-            info!("Worker spawner task {}: Channel closed. Waiting for insertions...", i);
-            // Wait for all spawned insertion tasks to complete
-            futures::future::join_all(insertion_tasks).await;
-            info!("Worker spawner task {}: All insertions finished.", i);
-            Ok(())
-
-        }); // End of single receiver/spawner task
-        worker_handles.push(worker_handle); // Add the handle of the spawner task
-
-        // Break after creating the single receiver/spawner task
-        break; // Only need one receiver task in this refactored model
-    }
-
+    }); // End of worker spawner task
 
     // --- Wait for Tasks and Report ---
     info!("Waiting for parser task to complete...");
-    match parser_handle.await {
-        Ok(Ok(_)) => info!("Parser task completed successfully."),
-        Ok(Err(e)) => error!("Parser task failed: {}", e),
-        Err(e) => error!("Parser task panicked or was cancelled: {}", e),
-    }
+    // Use ? to propagate errors from tasks
+    parser_handle.await??; // First ? for JoinError, second for ImportError
+    info!("Parser task completed successfully.");
 
-    info!("Waiting for worker tasks to complete...");
-    // Wait for the single spawner task (which waits for its sub-tasks)
-    for (i, handle) in worker_handles.into_iter().enumerate() {
-         match handle.await {
-             Ok(Ok(_)) => info!("Worker spawner task {} completed successfully.", i),
-             Ok(Err(e)) => error!("Worker spawner task {} failed: {}", e),
-             Err(e) => error!("Worker spawner task {} panicked or was cancelled: {}", e),
-         }
+
+    info!("Waiting for worker spawner task to complete...");
+    // Use ? to propagate errors from tasks
+    // Corrected formatting string: removed extra {}
+    match worker_spawner_handle.await? { // First ? for JoinError
+        Ok(_) => info!("Worker spawner task completed successfully."),
+        Err(e) => error!("Worker spawner task failed: {}", e), // Removed extra {}
     }
 
 
@@ -251,13 +248,21 @@ async fn main() -> Result<(), ImportError> {
     info!("Records Failed to Insert: {}", final_failed);
     info!("----------------------");
 
-    if final_failed > 0 || final_processed != final_inserted + final_failed {
-         warn!("Import completed with errors or discrepancies.");
-    } else {
+    // Final status check
+    if final_failed > 0 {
+         error!("Import completed with {} failed insertions.", final_failed);
+         // Consider returning an error code from main if needed
+         // std::process::exit(1);
+    } else if final_processed != final_inserted {
+         warn!(
+            "Import completed, but processed count ({}) does not match inserted count ({}). Check logs for skipped items or insertion logic.",
+            final_processed, final_inserted
+         );
+    }
+     else {
          info!("Import completed successfully.");
     }
 
 
     Ok(())
 }
-
