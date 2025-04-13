@@ -4,3 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+surrealdb = { version = "1.0.0", features = ["ws"] } # SurrealDB client (ensure version is compatible)
+tokio = { version = "1", features = ["full"] }      # Async runtime
+serde = { version = "1.0", features = ["derive"] }  # Serialization/Deserialization framework
+serde_json = "1.0"                                 # JSON handling
+log = "0.4"                                        # Logging facade
+env_logger = "0.11"                                # Logging implementation (simple, env-based)
+futures = "0.3"                                    # Async utilities (like try_join_all)
+thiserror = "1.0"                                  # Error handling helper
+# Optional: Add 'clap' for command-line argument parsing
+# clap = { version = "4.0", features = ["derive"] }
+# Optional: Add 'colored' for more explicit color control if needed
+# colored = "2"
