@@ -176,22 +176,22 @@ async fn main() -> Result<(), ImportError> {
             // Spawn a new task for the actual database insertion
             let task_handle = tokio::spawn(async move {
                 debug!("Insertion task: Processing record...");
-                // Add explicit type annotation for the expected result
-                let result: Result<Option<Value>, surrealdb::Error> =
+                // Corrected type annotation for the expected result: Vec<Value>
+                let result: Result<Vec<Value>, surrealdb::Error> =
                     db_clone.create(TABLE_NAME).content(record.clone()).await;
 
                 match result {
                     Ok(created_result) => {
-                         // created_result is now Option<Value>
-                         if created_result.is_some() {
+                         // created_result is now Vec<Value>
+                         // Check if the returned vector is non-empty as indication of success
+                         if !created_result.is_empty() {
                             worker_inserted_count_clone.fetch_add(1, Ordering::Relaxed);
                             debug!("Insertion task: Record inserted successfully.");
                          } else {
-                            // This might happen on duplicate IDs with certain strategies, or if create returns None on success.
-                            // Clarify expected return value for successful create.
-                            warn!("Insertion task: db.create command returned None/Empty. Assuming success/duplicate ignored. Record snippet: {:.200}", record.to_string());
-                            // Decide whether to count this as inserted or failed based on desired logic.
-                            // Let's assume success for now if no error.
+                            // This might happen if CREATE returns empty array on success in some cases?
+                            // Or maybe on duplicate ID with certain strategies.
+                            warn!("Insertion task: db.create command returned Ok([]). Assuming success/duplicate ignored. Record snippet: {:.200}", record.to_string());
+                            // Count as inserted if no error occurred.
                             worker_inserted_count_clone.fetch_add(1, Ordering::Relaxed);
                          }
                     }
