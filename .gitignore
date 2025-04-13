@@ -1,0 +1,6 @@
+/target
+resources/
+*.txt
+*.db
+*.json
+
