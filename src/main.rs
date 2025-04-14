@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 // Use tracing macros
-use tracing::{debug, error, info, warn, Instrument, Level, info_span};
+// Removed unused Level import
+use tracing::{debug, error, info, warn, Instrument, info_span};
 use tracing_subscriber::{fmt, EnvFilter}; // Import tracing_subscriber components
 
 use serde_json::Value;
@@ -46,14 +47,11 @@ enum ImportError {
 #[tokio::main]
 async fn main() -> Result<(), ImportError> {
     // Initialize tracing subscriber
-    // Use RUST_LOG env var for filtering (e.g., "info", "debug", "warn", "rust_surrealdb_importer=debug")
-    // Enable ANSI colors for formatted output.
     fmt()
         .with_env_filter(EnvFilter::from_default_env())
-        .with_ansi(true) // Ensure colors are enabled
+        .with_ansi(true)
         .init();
 
-    // Root span for the entire application run
     let app_span = info_span!("main_app");
     async move { // Move logic into the span's async block
 
@@ -67,7 +65,6 @@ async fn main() -> Result<(), ImportError> {
         info!("  Worker Tasks Limit: {}", NUM_WORKERS);
         info!("  Channel Buffer: {}", CHANNEL_BUFFER_SIZE);
 
-        // Shared atomic counters for statistics
         let processed_count = Arc::new(AtomicUsize::new(0));
         let inserted_count = Arc::new(AtomicUsize::new(0));
         let failed_count = Arc::new(AtomicUsize::new(0));
@@ -76,7 +73,6 @@ async fn main() -> Result<(), ImportError> {
 
         // --- Spawn Parser Task ---
         let parser_processed_count = processed_count.clone();
-        // Instrument the parser task to associate logs with it
         let parser_handle: JoinHandle<Result<(), ImportError>> = tokio::spawn(
             async move {
                 info!("Parser task started. Reading from: {}", FILE_PATH);
@@ -95,13 +91,18 @@ async fn main() -> Result<(), ImportError> {
                                 }
                                 parser_processed_count.fetch_add(1, Ordering::Relaxed);
                             } else {
+                                // Refactored match statement for clarity and to avoid macro issues
+                                let type_str = match record {
+                                    serde_json::Value::Null => "null",
+                                    serde_json::Value::Bool(_) => "boolean",
+                                    serde_json::Value::Number(_) => "number",
+                                    serde_json::Value::String(_) => "string",
+                                    serde_json::Value::Array(_) => "array",
+                                    serde_json::Value::Object(_) => "object", // Should not happen here
+                                };
                                 warn!(
                                     "Skipping item - not a JSON object. Type: {}",
-                                    match record {
-                                        Value::Null => "null", Value::Bool(_) => "boolean",
-                                        Value::Number(_) => "number", Value::String(_) => "string",
-                                        Value::Array(_) => "array", Value::Object(_) => "object",
-                                    }
+                                    type_str
                                 );
                             }
                         }
@@ -113,7 +114,7 @@ async fn main() -> Result<(), ImportError> {
                 info!("Parser task finished reading file.");
                 Ok(())
             }
-            .instrument(info_span!("parser_task")), // Apply span to the parser future
+            .instrument(info_span!("parser_task")),
         );
 
         // --- Spawn Worker Spawner Task ---
@@ -121,7 +122,6 @@ async fn main() -> Result<(), ImportError> {
         let worker_inserted_count = inserted_count.clone();
         let worker_failed_count = failed_count.clone();
 
-        // Instrument the worker spawner task
         let worker_spawner_handle: JoinHandle<Result<(), ImportError>> = tokio::spawn(
             async move {
                 info!("Worker spawner task starting...");
@@ -140,9 +140,12 @@ async fn main() -> Result<(), ImportError> {
                     let worker_inserted_count_clone = worker_inserted_count.clone();
                     let worker_failed_count_clone = worker_failed_count.clone();
                     let semaphore_clone = semaphore.clone();
-                    // Get a unique identifier for the record if possible (e.g., an 'id' field)
-                    // Otherwise, use the processed count (less reliable if parser skips items)
-                    let record_id_str = record.get("id").and_then(|v| v.as_str()).map(str::to_string).unwrap_or_else(|| format!("record_{}", processed_count.load(Ordering::Relaxed)));
+                    // Use processed_count from the outer scope for the record ID span
+                    // Note: This count might not perfectly match the record number if parsing skips items,
+                    // but it provides a sequential identifier for tracing.
+                    let current_processed_count = processed_count.load(Ordering::Relaxed);
+                    let record_id_str = record.get("id").and_then(|v| v.as_str()).map(str::to_string)
+                        .unwrap_or_else(|| format!("record_{}", current_processed_count));
 
 
                     let permit = match semaphore_clone.acquire_owned().await {
@@ -150,7 +153,6 @@ async fn main() -> Result<(), ImportError> {
                          Err(_) => { error!("Semaphore closed unexpectedly."); break; }
                     };
 
-                    // Define the async block for the insertion task
                     let insertion_future = async move {
                         debug!("Processing record...");
                         let result: Result<Vec<Value>, surrealdb::Error> =
@@ -171,14 +173,12 @@ async fn main() -> Result<(), ImportError> {
                                 worker_failed_count_clone.fetch_add(1, Ordering::Relaxed);
                             }
                         }
-                        drop(permit); // Release permit when done
+                        drop(permit);
                     };
 
-                    // Instrument the insertion future with a span including the record identifier
                     let instrumented_insertion = insertion_future
                         .instrument(info_span!("insertion_task", record_id = %record_id_str));
 
-                    // Spawn the instrumented future
                     let task_handle = tokio::spawn(instrumented_insertion);
                     insertion_tasks.push(task_handle);
                 }
@@ -193,7 +193,7 @@ async fn main() -> Result<(), ImportError> {
                 info!("All insertion tasks finished.");
                 Ok(())
             }
-            .instrument(info_span!("worker_spawner")), // Apply span to the worker spawner future
+            .instrument(info_span!("worker_spawner")),
         );
 
         // --- Wait for Tasks and Report ---
