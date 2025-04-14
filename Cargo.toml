@@ -4,15 +4,16 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-surrealdb = "1.0.0"                                # SurrealDB client (ensure version is compatible)
+surrealdb = "1.0.0"                                # SurrealDB client
 tokio = { version = "1", features = ["full"] }      # Async runtime
 serde = { version = "1.0", features = ["derive"] }  # Serialization/Deserialization framework
 serde_json = "1.0"                                 # JSON handling
-log = "0.4"                                        # Logging facade
-env_logger = "0.11"                                # Logging implementation (simple, env-based)
-futures = "0.3"                                    # Async utilities (like try_join_all)
+# log = "0.4"                                      # Replaced by tracing
+# env_logger = "0.11"                              # Replaced by tracing-subscriber
+futures = "0.3"                                    # Async utilities
 thiserror = "1.0"                                  # Error handling helper
+tracing = "0.1"                                    # Logging facade (structured)
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] } # Logging implementation
+
 # Optional: Add 'clap' for command-line argument parsing
 # clap = { version = "4.0", features = ["derive"] }
-# Optional: Add 'colored' for more explicit color control if needed
-# colored = "2"
