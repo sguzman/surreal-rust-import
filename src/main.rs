@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::{self, BufReader};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration; // Needed for retry strategy
+// use std::time::Duration; // Removed unused import
 
 // Use tracing macros
 use tracing::{debug, error, info, warn, Instrument, info_span};
@@ -82,31 +82,51 @@ async fn main() -> Result<(), ImportError> {
                 info!("Parser task started. Reading from: {}", FILE_PATH);
                 let file = File::open(FILE_PATH)?;
                 let reader = BufReader::new(file);
+                // Create a stream deserializer for the JSON array
+                // into_iter yields top-level values from the input stream.
+                // If the input is `[{}, {}]`, it yields the `{}` objects.
+                // If the input is `[[{}, {}]]`, it yields the inner `[{}, {}]` array as one Value.
                 let stream = serde_json::Deserializer::from_reader(reader).into_iter::<Value>();
 
                 for result in stream {
                     match result {
                         Ok(record) => {
+                            // *** Enhanced Logging ***
+                            // Log exactly what type was received before checking if it's an object
+                            let record_type_str = match record {
+                                serde_json::Value::Null => "null",
+                                serde_json::Value::Bool(_) => "boolean",
+                                serde_json::Value::Number(_) => "number",
+                                serde_json::Value::String(_) => "string",
+                                serde_json::Value::Array(_) => "array",
+                                serde_json::Value::Object(_) => "object",
+                            };
+                            // Log a snippet for non-objects, use debug level
+                            if !record.is_object() {
+                                debug!(value_type = %record_type_str, value_snippet = %format!("{:.100}", record), "Parser received top-level value (not an object)");
+                            } else {
+                                 debug!(value_type = %record_type_str, "Parser received top-level value");
+                            }
+                            // *** End Enhanced Logging ***
+
+
+                            // Now, check if it's the object we expect to send
                             if record.is_object() {
-                                debug!("Sending record to workers.");
+                                debug!("Sending record object to workers.");
                                 if tx.send(record).await.is_err() {
                                     warn!("Channel closed by receiver. Stopping parser task.");
                                     break;
                                 }
                                 parser_processed_count.fetch_add(1, Ordering::Relaxed);
                             } else {
-                                let type_str = match record {
-                                    serde_json::Value::Null => "null",
-                                    serde_json::Value::Bool(_) => "boolean",
-                                    serde_json::Value::Number(_) => "number",
-                                    serde_json::Value::String(_) => "string",
-                                    serde_json::Value::Array(_) => "array",
-                                    serde_json::Value::Object(_) => "object",
-                                };
+                                // Log the warning about skipping non-object types
                                 warn!(
-                                    "Skipping item - not a JSON object. Type: {}",
-                                    type_str
+                                    "Skipping top-level item - not a JSON object. Type: {}",
+                                    record_type_str
                                 );
+                                // Depending on expected input, maybe we should error out here?
+                                // If we expect ONLY [{}, {}, ...], anything else is an error.
+                                // For now, just warn and skip.
                             }
                         }
                         Err(e) => {
@@ -123,6 +143,7 @@ async fn main() -> Result<(), ImportError> {
         );
 
         // --- Spawn Worker Spawner Task ---
+        // (Worker code remains the same for now)
         let semaphore = Arc::new(tokio::sync::Semaphore::new(NUM_WORKERS));
         let worker_processed_count = processed_count.clone();
         let worker_inserted_count = inserted_count.clone();
@@ -155,35 +176,26 @@ async fn main() -> Result<(), ImportError> {
                          Err(_) => { error!("Semaphore closed unexpectedly."); break; }
                     };
 
-                    // Define the async block for the insertion task with retry logic
                     let insertion_future = async move {
-                        // Define retry strategy: Exponential backoff starting at 100ms, max 3 retries.
-                        // Jitter adds randomness to avoid thundering herd.
                         let retry_strategy = ExponentialBackoff::from_millis(100)
-                            .map(jitter) // Apply jitter
-                            .take(3);    // Limit to 3 retries
+                            .map(jitter)
+                            .take(3);
 
-                        debug!("Processing record...");
+                        debug!("Processing record..."); // This log is within the insertion task span
 
-                        // Use Retry::spawn to execute the database creation with retries
                         let result = Retry::spawn(retry_strategy, || async {
-                            // This closure is executed for each attempt
                             let attempt_result: Result<Vec<Value>, surrealdb::Error> =
                                 db_clone.create(TABLE_NAME).content(record.clone()).await;
 
                             match attempt_result {
-                                Ok(v) => Ok(v), // Success, stop retrying
+                                Ok(v) => Ok(v),
                                 Err(e) => {
-                                    // Check if the error is potentially recoverable (like a timeout)
-                                    // For simplicity now, we retry on any DB error, but log it.
-                                    // In production, you might inspect `e` further.
                                     warn!("DB create failed, retrying... Error: {}", e);
-                                    Err(e) // Propagate error to signal retry
+                                    Err(e)
                                 }
                             }
-                        }).await; // Await the final result after retries
+                        }).await;
 
-                        // Handle the final result after retries
                         match result {
                             Ok(created_result) => {
                                  if !created_result.is_empty() {
@@ -195,12 +207,11 @@ async fn main() -> Result<(), ImportError> {
                                  }
                             }
                             Err(e) => {
-                                // This error occurred even after retries
                                 error!("Database error after retries: {}", e);
                                 task_failed_count.fetch_add(1, Ordering::Relaxed);
                             }
                         }
-                        drop(permit); // Release permit
+                        drop(permit);
                     };
 
                     let instrumented_insertion = insertion_future

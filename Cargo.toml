@@ -3,6 +3,13 @@ name = "rust-surreal-import"
 version = "0.1.0"
 edition = "2024"
 
+[profile.release]
+lto = true
+strip = true
+opt-level = 3
+panic = 'abort'
+codegen-units = 1
+
 [dependencies]
 surrealdb = "1.0.0"                                # SurrealDB client
 tokio = { version = "1", features = ["full"] }      # Async runtime
