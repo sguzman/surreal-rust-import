@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 // Use tracing macros
-// Removed unused Level import
 use tracing::{debug, error, info, warn, Instrument, info_span};
 use tracing_subscriber::{fmt, EnvFilter}; // Import tracing_subscriber components
 
@@ -65,6 +64,8 @@ async fn main() -> Result<(), ImportError> {
         info!("  Worker Tasks Limit: {}", NUM_WORKERS);
         info!("  Channel Buffer: {}", CHANNEL_BUFFER_SIZE);
 
+        // Shared atomic counters for statistics
+        // These original Arcs will remain in the main scope
         let processed_count = Arc::new(AtomicUsize::new(0));
         let inserted_count = Arc::new(AtomicUsize::new(0));
         let failed_count = Arc::new(AtomicUsize::new(0));
@@ -72,8 +73,10 @@ async fn main() -> Result<(), ImportError> {
         let (tx, mut rx) = mpsc::channel::<Value>(CHANNEL_BUFFER_SIZE);
 
         // --- Spawn Parser Task ---
+        // Clone the Arc needed for the parser task
         let parser_processed_count = processed_count.clone();
         let parser_handle: JoinHandle<Result<(), ImportError>> = tokio::spawn(
+            // The async move block captures parser_processed_count (the clone)
             async move {
                 info!("Parser task started. Reading from: {}", FILE_PATH);
                 let file = File::open(FILE_PATH)?;
@@ -89,16 +92,16 @@ async fn main() -> Result<(), ImportError> {
                                     warn!("Channel closed by receiver. Stopping parser task.");
                                     break;
                                 }
+                                // Use the cloned Arc here
                                 parser_processed_count.fetch_add(1, Ordering::Relaxed);
                             } else {
-                                // Refactored match statement for clarity and to avoid macro issues
                                 let type_str = match record {
                                     serde_json::Value::Null => "null",
                                     serde_json::Value::Bool(_) => "boolean",
                                     serde_json::Value::Number(_) => "number",
                                     serde_json::Value::String(_) => "string",
                                     serde_json::Value::Array(_) => "array",
-                                    serde_json::Value::Object(_) => "object", // Should not happen here
+                                    serde_json::Value::Object(_) => "object",
                                 };
                                 warn!(
                                     "Skipping item - not a JSON object. Type: {}",
@@ -119,10 +122,13 @@ async fn main() -> Result<(), ImportError> {
 
         // --- Spawn Worker Spawner Task ---
         let semaphore = Arc::new(tokio::sync::Semaphore::new(NUM_WORKERS));
+        // Clone the Arcs needed for the worker spawner task *before* the async move block
+        let worker_processed_count = processed_count.clone(); // Clone for use inside worker spawner
         let worker_inserted_count = inserted_count.clone();
         let worker_failed_count = failed_count.clone();
 
         let worker_spawner_handle: JoinHandle<Result<(), ImportError>> = tokio::spawn(
+            // This async move block captures the *clones* made above
             async move {
                 info!("Worker spawner task starting...");
                 let db = Surreal::new::<Ws>(DATABASE_URL).await?;
@@ -136,14 +142,14 @@ async fn main() -> Result<(), ImportError> {
                 let mut insertion_tasks = Vec::new();
 
                 while let Some(record) = rx.recv().await {
+                    // Clone Arcs again for the individual insertion tasks
                     let db_clone = db.clone();
-                    let worker_inserted_count_clone = worker_inserted_count.clone();
-                    let worker_failed_count_clone = worker_failed_count.clone();
+                    let task_inserted_count = worker_inserted_count.clone(); // Clone from worker spawner's clone
+                    let task_failed_count = worker_failed_count.clone(); // Clone from worker spawner's clone
                     let semaphore_clone = semaphore.clone();
-                    // Use processed_count from the outer scope for the record ID span
-                    // Note: This count might not perfectly match the record number if parsing skips items,
-                    // but it provides a sequential identifier for tracing.
-                    let current_processed_count = processed_count.load(Ordering::Relaxed);
+
+                    // Use the worker_processed_count clone here
+                    let current_processed_count = worker_processed_count.load(Ordering::Relaxed);
                     let record_id_str = record.get("id").and_then(|v| v.as_str()).map(str::to_string)
                         .unwrap_or_else(|| format!("record_{}", current_processed_count));
 
@@ -153,6 +159,7 @@ async fn main() -> Result<(), ImportError> {
                          Err(_) => { error!("Semaphore closed unexpectedly."); break; }
                     };
 
+                    // This async move block captures task_inserted_count and task_failed_count
                     let insertion_future = async move {
                         debug!("Processing record...");
                         let result: Result<Vec<Value>, surrealdb::Error> =
@@ -161,16 +168,16 @@ async fn main() -> Result<(), ImportError> {
                         match result {
                             Ok(created_result) => {
                                  if !created_result.is_empty() {
-                                    worker_inserted_count_clone.fetch_add(1, Ordering::Relaxed);
+                                    task_inserted_count.fetch_add(1, Ordering::Relaxed); // Use task's clone
                                     debug!("Record inserted successfully.");
                                  } else {
                                     warn!("db.create returned Ok([]). Assuming success/duplicate ignored. Snippet: {:.200}", record.to_string());
-                                    worker_inserted_count_clone.fetch_add(1, Ordering::Relaxed);
+                                    task_inserted_count.fetch_add(1, Ordering::Relaxed); // Use task's clone
                                  }
                             }
                             Err(e) => {
                                 error!("Database error: {}", e);
-                                worker_failed_count_clone.fetch_add(1, Ordering::Relaxed);
+                                task_failed_count.fetch_add(1, Ordering::Relaxed); // Use task's clone
                             }
                         }
                         drop(permit);
@@ -208,6 +215,7 @@ async fn main() -> Result<(), ImportError> {
         }
 
         info!("--- Import Summary ---");
+        // Use the original Arcs here, which were never moved
         let final_processed = processed_count.load(Ordering::SeqCst);
         let final_inserted = inserted_count.load(Ordering::SeqCst);
         let final_failed = failed_count.load(Ordering::SeqCst);
@@ -219,9 +227,13 @@ async fn main() -> Result<(), ImportError> {
         if final_failed > 0 {
              error!("Import completed with {} failed insertions.", final_failed);
         } else if final_processed != final_inserted {
+             // Adjusting this check slightly - parser_processed counts items sent,
+             // inserted counts successful DB inserts. They might differ if items are skipped
+             // or if DB create returns Ok([]) which we count as success.
+             // A mismatch isn't necessarily an error, but worth noting.
              warn!(
-                "Import completed, but processed count ({}) != inserted count ({}). Check logs.",
-                final_processed, final_inserted
+                "Import finished. Processed count ({}) != Inserted count ({}). Failed: {}. Check logs for skipped items or DB warnings.",
+                final_processed, final_inserted, final_failed
              );
         } else {
              info!("Import completed successfully.");
