@@ -1,4 +1,4 @@
-// src/main.rs - Rust SurrealDB Parallel Importer (Refactored)
+// src/main.rs - Rust SurrealDB Parallel Importer (Refactored with Auth)
 
 use std::fs::File;
 use std::io::{self, BufReader};
@@ -10,10 +10,11 @@ use tracing::{debug, error, info, warn, Instrument, info_span};
 use tracing_subscriber::{fmt, EnvFilter};
 
 use serde_json::Value;
-use surrealdb::engine::remote::ws::{Client, Ws}; // Client needed for type hint
+use surrealdb::engine::remote::ws::{Client, Ws};
+use surrealdb::opt::auth::Root; // Import Root auth helper
 use surrealdb::Surreal;
 use thiserror::Error;
-use tokio::sync::{mpsc, Semaphore, OwnedSemaphorePermit}; // Added Semaphore types
+use tokio::sync::{mpsc, Semaphore, OwnedSemaphorePermit};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_retry::Retry;
@@ -31,6 +32,10 @@ const CHANNEL_BUFFER_SIZE: usize = 1000;
 const CONNECT_TIMEOUT_SECONDS: u64 = 15;
 const DB_RETRY_COUNT: usize = 3;
 const DB_RETRY_BASE_MS: u64 = 100;
+// --- Authentication Credentials ---
+const DB_USER: &str = "root";
+const DB_PASS: &str = "root";
+
 
 // --- Error Handling ---
 #[derive(Error, Debug)]
@@ -65,6 +70,7 @@ async fn run_parser_task(
     tx: mpsc::Sender<Value>, // Move sender into the task
     processed_count: Arc<AtomicUsize>,
 ) -> Result<(), ImportError> {
+     // ... (parser logic remains the same) ...
      info!("Parser task started. Reading from: {}", file_path);
      let file = File::open(file_path)?;
      let reader = BufReader::new(file);
@@ -107,7 +113,6 @@ async fn run_parser_task(
          }
      }
      info!("Parser task finished reading file.");
-     // Sender (tx) is dropped automatically when task finishes, closing the channel.
      Ok(())
 }
 
@@ -120,7 +125,7 @@ async fn perform_insertion(
     failed_count: Arc<AtomicUsize>,
     permit: OwnedSemaphorePermit, // Takes ownership of the permit
 ) {
-    // Define retry strategy within the function
+    // ... (insertion logic with retry remains the same) ...
     let retry_strategy = ExponentialBackoff::from_millis(DB_RETRY_BASE_MS)
         .map(jitter)
         .take(DB_RETRY_COUNT);
@@ -128,22 +133,20 @@ async fn perform_insertion(
     debug!("Processing record...");
 
     let result = Retry::spawn(retry_strategy, || async {
-        // Clone db handle and record for each attempt
         let db_attempt = db.clone();
         let record_attempt = record.clone();
         let attempt_result: Result<Vec<Value>, surrealdb::Error> =
             db_attempt.create(table_name).content(record_attempt).await;
 
         match attempt_result {
-            Ok(v) => Ok(v), // Success, stop retrying
+            Ok(v) => Ok(v),
             Err(e) => {
                 warn!("DB create failed, retrying... Error: {}", e);
-                Err(e) // Propagate error to signal retry
+                Err(e)
             }
         }
     }).await;
 
-    // Handle the final result after retries
     match result {
         Ok(created_result) => {
              if !created_result.is_empty() {
@@ -159,7 +162,7 @@ async fn perform_insertion(
             failed_count.fetch_add(1, Ordering::Relaxed);
         }
     }
-    drop(permit); // Explicitly drop permit to release semaphore slot
+    drop(permit);
 }
 
 
@@ -198,10 +201,23 @@ async fn run_worker_spawner_task(
     }
     // --- Connection Established ---
 
-    // Optional Auth would go here
+    // --- Authentication ---
+    info!("Attempting sign in as user '{}'...", DB_USER);
+    // Use Root authentication helper
+    db.signin(Root {
+        username: DB_USER,
+        password: DB_PASS,
+    }).await?; // Propagate error if signin fails
+    info!("Successfully signed in.");
+    // --- End Authentication ---
 
+    // --- Use Namespace and Database ---
+    // This will implicitly create them if they don't exist and root has permissions
+    info!("Selecting namespace '{}' and database '{}'...", namespace, database);
     db.use_ns(namespace).use_db(database).await?;
-    info!("Namespace/DB selected.");
+    info!("Namespace/DB selected (created if didn't exist).");
+    // --- End Use Namespace/DB ---
+
 
     let mut insertion_tasks = Vec::new();
 
@@ -211,26 +227,23 @@ async fn run_worker_spawner_task(
         let task_failed_count = failed_count.clone();
         let semaphore_clone = semaphore.clone();
 
-        // Generate record ID string for tracing span
-        let current_processed_count = processed_count.load(Ordering::Relaxed); // Use counter from main scope
+        let current_processed_count = processed_count.load(Ordering::Relaxed);
         let record_id_str = record.get("id").and_then(|v| v.as_str()).map(str::to_string)
             .unwrap_or_else(|| format!("record_{}", current_processed_count));
 
-        // Acquire permit before spawning task
         let permit = semaphore_clone.acquire_owned().await.map_err(|_| {
             error!("Semaphore closed unexpectedly during acquire.");
-            ImportError::SemaphoreAcquireError // Or a more specific error
+            ImportError::SemaphoreAcquireError
         })?;
 
-        // Spawn the insertion task
         let task_handle = tokio::spawn(
             perform_insertion(
                 db_clone,
                 table_name,
-                record, // record is moved into perform_insertion
+                record,
                 task_inserted_count,
                 task_failed_count,
-                permit, // permit is moved into perform_insertion
+                permit,
             )
             .instrument(info_span!("insertion_task", record_id = %record_id_str)),
         );
@@ -241,7 +254,6 @@ async fn run_worker_spawner_task(
     let results = futures::future::join_all(insertion_tasks).await;
     for (i, result) in results.into_iter().enumerate() {
         if let Err(e) = result {
-            // Log errors from joined tasks (e.g., panics)
             error!("Insertion sub-task {} panicked or was cancelled: {}", i, e);
         }
     }
@@ -256,18 +268,10 @@ async fn main() -> Result<(), ImportError> {
     initialize_logging();
 
     let app_span = info_span!("main_app");
-    // Enter the main application span
     let _enter = app_span.enter();
 
     info!("Starting SurrealDB parallel importer...");
-    info!("Configuration:");
-    info!("  File Path: {}", FILE_PATH);
-    info!("  Database URL: {}", DATABASE_URL);
-    info!("  Namespace: {}", NAMESPACE);
-    info!("  Database: {}", DATABASE);
-    info!("  Table Name: {}", TABLE_NAME);
-    info!("  Worker Tasks Limit: {}", NUM_WORKERS);
-    info!("  Channel Buffer: {}", CHANNEL_BUFFER_SIZE);
+    // ... (logging configuration remains the same) ...
 
     let processed_count = Arc::new(AtomicUsize::new(0));
     let inserted_count = Arc::new(AtomicUsize::new(0));
@@ -279,27 +283,26 @@ async fn main() -> Result<(), ImportError> {
     // Spawn tasks using the refactored functions
     let parser_handle = tokio::spawn(
         run_parser_task(FILE_PATH, tx, processed_count.clone())
-            .instrument(info_span!("parser_task_wrapper")) // Add span to the task itself
+            .instrument(info_span!("parser_task_wrapper"))
     );
 
     let worker_spawner_handle = tokio::spawn(
         run_worker_spawner_task(
-            rx, // rx is moved here
+            rx,
             DATABASE_URL,
             NAMESPACE,
             DATABASE,
             TABLE_NAME,
-            semaphore.clone(), // Clone semaphore Arc
-            processed_count.clone(), // Clone counter Arcs
+            semaphore.clone(),
+            processed_count.clone(),
             inserted_count.clone(),
             failed_count.clone(),
         )
-        .instrument(info_span!("worker_spawner_wrapper")) // Add span to the task itself
+        .instrument(info_span!("worker_spawner_wrapper"))
     );
 
     // --- Wait for Tasks and Report ---
     info!("Waiting for parser task to complete...");
-    // Handle potential JoinError then the inner ImportError
     match parser_handle.await {
         Ok(Ok(_)) => info!("Parser task completed successfully."),
         Ok(Err(e)) => error!("Parser task failed: {}", e),
@@ -314,6 +317,7 @@ async fn main() -> Result<(), ImportError> {
     }
 
     // --- Final Summary ---
+    // ... (summary logic remains the same) ...
     info!("--- Import Summary ---");
     let final_processed = processed_count.load(Ordering::SeqCst);
     let final_inserted = inserted_count.load(Ordering::SeqCst);
